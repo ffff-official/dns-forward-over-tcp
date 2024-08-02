@@ -1,0 +1,21 @@
+[package]
+name = "dns-forward-over-tcp"
+description = """
+    As a dns server. forward data over TCP.
+"""
+license = "MIT/Apache-2.0"
+readme = "README.md"
+keywords = ["dns", "domain", "tcp", "forward"]
+homepage = "https://github.com/ffff-official/dns-forward-over-tcp"
+categories = ["network-programming"]
+documentation = "https://docs.rs/dns-forward-over-tcp"
+version = "0.1.1"
+edition = "2021"
+authors = ["F <f@ffff.im>"]
+
+[dependencies]
+log = "0.4.17"
+dns-parser = "0.8.0"
+tokio = { version = "1.21.2", features = ["full"] }
+simple_logger = "2.3.0"
+getopts = "0.2"

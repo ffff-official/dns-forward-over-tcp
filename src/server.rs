@@ -1,36 +1,37 @@
-use crossbeam_channel::{bounded, Receiver};
+use async_trait::async_trait;
+use crossbeam_channel::{bounded, unbounded, Receiver};
 use dns_parser::Packet;
 use log::{error, info, warn};
 use std::cmp;
-use std::future::Future;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
-use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 
-pub type ForwardCallback =
-    fn(&Packet) -> (bool, Option<Box<dyn Fn(Option<&Packet>) + Send + 'static>>);
+#[async_trait]
+pub trait RecordCallback<T>: Send + Sync {
+    async fn request(&self, res: &Packet<'_>) -> (bool, Option<T>);
+    async fn response(&self, req: Option<&Packet<'_>>, context: Option<T>);
+}
 
-pub struct DnsServer {
+pub struct DnsServer<T> {
     udp_socket: Arc<UdpSocket>,
     tcp_server: Option<TcpStream>,
 
-    foward_callback: Option<ForwardCallback>,
-
     upstream: String,
+    callback: Arc<Box<dyn RecordCallback<T>>>,
 }
 
-impl DnsServer {
+impl<T: 'static + std::marker::Send> DnsServer<T> {
     pub async fn run(
         port: Option<String>,
         upstream: Option<String>,
         thread_num: Option<usize>,
-        foward_callback: Option<ForwardCallback>,
-    ) -> ExitCode {
+        callback: Box<dyn RecordCallback<T>>,
+    ) -> Result<(), Error> {
         let bind_with_port = if let Some(port) = port {
             if port.contains(":") {
                 port
@@ -47,23 +48,16 @@ impl DnsServer {
             String::from("8.8.8.8:53")
         };
 
-        let udp_socket = UdpSocket::bind(bind_with_port).await;
-        if udp_socket.is_err() {
-            error!("{}", udp_socket.err().unwrap().to_string());
-            return ExitCode::FAILURE;
-        }
+        let udp_socket = UdpSocket::bind(bind_with_port).await?;
 
-        let udp_server = Arc::new(udp_socket.unwrap());
+        let udp_server = Arc::new(udp_socket);
         let udp_socket = udp_server.clone();
 
-        let (sender, receiver) = bounded(1024);
+        let (sender, receiver) = unbounded();
 
-        let runtime = Runtime::new().unwrap();
-
-        runtime.spawn(async move {
+        tokio::spawn(async move {
             loop {
                 let mut buff = [0; 1024];
-
                 let rr = udp_server.recv_from(&mut buff).await;
                 if rr.is_err() {
                     warn!("udp recv error. {:?}", rr.err());
@@ -82,16 +76,21 @@ impl DnsServer {
             cmp::min(4, num_cpus::get())
         };
 
+        let runtime = Runtime::new().unwrap();
+        let callback = Arc::new(callback);
+
         for _ in 0..thread_num {
             let udp_socket = udp_socket.clone();
             let receiver = receiver.clone();
 
-            let mut s = DnsServer {
+            let callback = callback.clone();
+
+            let mut s = DnsServer::<T> {
                 udp_socket,
                 upstream: upstream.clone(),
 
                 tcp_server: None,
-                foward_callback,
+                callback,
             };
 
             handles.push(runtime.spawn(async move {
@@ -103,10 +102,10 @@ impl DnsServer {
             let _ = h.await;
         }
 
-        return ExitCode::SUCCESS;
+        Ok(())
     }
 
-    async fn process(dns_server: &mut DnsServer, receiver: Receiver<(Vec<u8>, SocketAddr)>) {
+    async fn process(dns_server: &mut DnsServer<T>, receiver: Receiver<(Vec<u8>, SocketAddr)>) {
         loop {
             let rr = receiver.recv();
             if rr.is_err() {
@@ -123,25 +122,25 @@ impl DnsServer {
                 );
             }
 
-            let mut post_result_callback = None;
+            let callback = dns_server.callback.clone();
 
-            if let Some(foward_callback) = dns_server.foward_callback {
-                if let Ok(dns_res_packet) = dns_res_packet {
-                    let (pass, callback) = foward_callback(&dns_res_packet);
-                    post_result_callback = callback;
+            let mut res_context = None;
 
-                    if !pass {
-                        if let Ok(record) = dns_parser::Builder::new_query(
-                            dns_res_packet.header.id,
-                            dns_res_packet.header.recursion_available,
-                        )
-                        .build()
-                        {
-                            let _ = dns_server.udp_socket.send_to(&record, src_addr).await;
-                        }
+            if let Ok(dns_res_packet) = dns_res_packet {
+                let (pass, context) = callback.request(&dns_res_packet).await;
+                res_context = context;
 
-                        continue;
+                if !pass {
+                    if let Ok(record) = dns_parser::Builder::new_query(
+                        dns_res_packet.header.id,
+                        dns_res_packet.header.recursion_available,
+                    )
+                    .build()
+                    {
+                        let _ = dns_server.udp_socket.send_to(&record, src_addr).await;
                     }
+
+                    continue;
                 }
             }
 
@@ -158,12 +157,7 @@ impl DnsServer {
                         }
                     }
 
-                    if let Some(tcp_server) = &mut dns_server.tcp_server {
-                        let _ = tcp_server.shutdown().await;
-                    }
-
                     dns_server.tcp_server = None;
-
                     continue;
                 }
 
@@ -177,18 +171,17 @@ impl DnsServer {
                     );
                 }
 
-                if let Some(post_result_callback) = post_result_callback {
-                    post_result_callback(dns_req_packet.ok().as_ref());
-                }
+                callback
+                    .response(dns_req_packet.ok().as_ref(), res_context)
+                    .await;
 
                 let _ = dns_server.udp_socket.send_to(&req_buff, src_addr).await;
-
                 break;
             }
         }
     }
 
-    async fn forward(&mut self, data: &[u8]) -> core::result::Result<Vec<u8>, std::io::Error> {
+    async fn forward(&mut self, data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
         if self.tcp_server.is_none() {
             self.connect_remote_server().await;
         }
@@ -197,7 +190,6 @@ impl DnsServer {
 
         let size = data.len() as u16;
         let r = tcp_server.write(&size.to_be_bytes()).await?;
-
         if r < size_of::<u16>() {
             return Err(Error::new(
                 ErrorKind::Other,
@@ -205,13 +197,12 @@ impl DnsServer {
             ));
         }
 
-        if let Ok(size) = tcp_server.write(data).await {
-            if size < data.len() {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!("forward data failed. {}", size),
-                ));
-            }
+        let r = tcp_server.write(data).await?;
+        if r < data.len() {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("forward data failed. {}", size),
+            ));
         }
 
         let size = tcp_server.read_u16().await?;
@@ -230,11 +221,11 @@ impl DnsServer {
         loop {
             if let Ok(s) = TcpStream::connect(&self.upstream).await {
                 self.tcp_server = Some(s);
-                return;
+                break;
             }
 
             warn!("connect {} failed. try again later.", &self.upstream);
-            std::thread::sleep(Duration::from_secs(3));
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 }

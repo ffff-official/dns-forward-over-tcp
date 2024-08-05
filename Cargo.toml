@@ -9,7 +9,7 @@ keywords = ["dns", "domain", "tcp", "forward"]
 homepage = "https://github.com/ffff-official/dns-forward-over-tcp"
 categories = ["network-programming"]
 documentation = "https://docs.rs/dns-forward-over-tcp"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["F <f@ffff.im>"]
 
@@ -19,3 +19,7 @@ dns-parser = "0.8.0"
 tokio = { version = "1.21.2", features = ["full"] }
 simple_logger = "2.3.0"
 getopts = "0.2"
+crossbeam-channel = "0.5.13"
+num_cpus = "1.16.0"
+async-trait = "0.1.81"
+#crossbeam-utils = "0.8.20"

@@ -1,38 +1,52 @@
+use async_trait::async_trait;
+use dns_forward_over_tcp::server::DnsServer;
+use dns_forward_over_tcp::server::RecordCallback;
 use getopts::Options;
 use log::info;
 use std::env;
-use std::process::ExitCode;
-
-use dns_forward_over_tcp::server::DnsServer;
+use std::error::Error;
+use std::time::Instant;
 
 fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} [options]", program);
     print!("{}", opts.usage(&brief));
 }
 
-#[tokio::main]
-async fn work(bind: Option<String>, upstream: Option<String>) -> ExitCode {
-    return DnsServer::run(
-        bind,
-        upstream,
-        Some(move |res, _| {
-            for ele in &res.questions {
-                info!("res: {:?} {:?}", ele.qname, ele.qtype);
-            }
-            return true;
-        }),
-        Some(|res, req_wrap| {
-            if let Some(req) = req_wrap {
-                for ele in &req.answers {
-                    info!("req: {:?} {:?}", ele.name, ele.data);
-                }
-            }
-        }),
-    )
-    .await;
+struct LogRecord {}
+
+impl LogRecord {
+    fn new() -> LogRecord {
+        return LogRecord {};
+    }
 }
 
-fn main() -> ExitCode {
+#[async_trait]
+impl RecordCallback<Instant> for LogRecord {
+    async fn request(&self, res: &dns_parser::Packet<'_>) -> (bool, Option<Instant>) {
+        for ele in &res.questions {
+            info!("res: {:?} {:?}", ele.qname, ele.qtype);
+        }
+
+        return (true, Some(Instant::now()));
+    }
+    async fn response(&self, req: Option<&dns_parser::Packet<'_>>, res_time: Option<Instant>) {
+        let t = Instant::now() - res_time.unwrap();
+
+        if let Some(req) = req {
+            let mut req_name = String::new();
+            for ele in &req.questions {
+                req_name = ele.qname.to_string();
+            }
+
+            for ele in &req.answers {
+                info!("req: {:?} {:?} {:?} {:?}", ele.name, req_name, ele.data, t);
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     simple_logger::init_with_level(log::Level::Info).unwrap();
 
     let args: Vec<String> = env::args().collect();
@@ -46,8 +60,8 @@ fn main() -> ExitCode {
         "IP:PORT",
     );
     opts.optopt("p", "", "listen port. default is :5353", "[IP]:PORT");
+    opts.optopt("t", "thread", "thread num. default is 4", "NUM");
     opts.optflag("h", "help", "print this help menu");
-    // opts.optflag("p", "", "listen port. default is 5353");
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
         Err(f) => {
@@ -56,16 +70,17 @@ fn main() -> ExitCode {
     };
     if matches.opt_present("h") {
         print_usage(&program, opts);
-        return ExitCode::FAILURE;
+        return Ok(());
     }
     let port = matches.opt_str("p");
     let upstream = matches.opt_str("u");
-    // let input = if !matches.free.is_empty() {
-    //     matches.free[0].clone()
-    // } else {
-    //     print_usage(&program, opts);
-    //     return;
-    // };
+    let thread_num = if let Some(thread_num) = matches.opt_str("t") {
+        thread_num.parse::<usize>().ok()
+    } else {
+        None
+    };
 
-    return work(port, upstream);
+    DnsServer::run(port, upstream, thread_num, Box::new(LogRecord::new())).await?;
+
+    Ok(())
 }

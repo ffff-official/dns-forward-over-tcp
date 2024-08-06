@@ -72,7 +72,7 @@ impl<T: 'static + std::marker::Send> DnsServer<T> {
         let thread_num = if let Some(thread_num) = thread_num {
             cmp::min(thread_num, num_cpus::get())
         } else {
-            cmp::min(4, num_cpus::get())
+            cmp::min(2, num_cpus::get())
         };
 
         let callback = Arc::new(callback);

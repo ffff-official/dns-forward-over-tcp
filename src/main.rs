@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "IP:PORT",
     );
     opts.optopt("p", "", "listen port. default is :5353", "[IP]:PORT");
-    opts.optopt("t", "thread", "thread num. default is 4", "NUM");
+    opts.optopt("t", "thread", "thread num. default is 2", "NUM");
     opts.optflag("h", "help", "print this help menu");
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,

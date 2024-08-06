@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use crossbeam_channel::{bounded, unbounded, Receiver};
 use dns_parser::Packet;
+use flume::{unbounded, Receiver};
 use log::{error, info, warn};
 use std::cmp;
 use std::io::{Error, ErrorKind};
@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::runtime::Runtime;
 
 #[async_trait]
 pub trait RecordCallback<T>: Send + Sync {
@@ -64,7 +63,7 @@ impl<T: 'static + std::marker::Send> DnsServer<T> {
                     continue;
                 }
                 if let Some((size, src_addr)) = rr.ok() {
-                    let _ = sender.send((buff[..size].to_vec(), src_addr));
+                    let _ = sender.send_async((buff[..size].to_vec(), src_addr)).await;
                 }
             }
         });
@@ -76,7 +75,6 @@ impl<T: 'static + std::marker::Send> DnsServer<T> {
             cmp::min(4, num_cpus::get())
         };
 
-        let runtime = Runtime::new().unwrap();
         let callback = Arc::new(callback);
 
         for _ in 0..thread_num {
@@ -93,7 +91,7 @@ impl<T: 'static + std::marker::Send> DnsServer<T> {
                 callback,
             };
 
-            handles.push(runtime.spawn(async move {
+            handles.push(tokio::spawn(async move {
                 Self::process(&mut s, receiver).await;
             }));
         }
@@ -107,7 +105,7 @@ impl<T: 'static + std::marker::Send> DnsServer<T> {
 
     async fn process(dns_server: &mut DnsServer<T>, receiver: Receiver<(Vec<u8>, SocketAddr)>) {
         loop {
-            let rr = receiver.recv();
+            let rr = receiver.recv_async().await;
             if rr.is_err() {
                 continue;
             }

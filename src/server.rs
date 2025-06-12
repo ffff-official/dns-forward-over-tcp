@@ -344,7 +344,7 @@ impl DnsServer {
                 self.get_forwarder(Some(&server)).await.ok()
             }
             Err(e) => {
-                warn!("parse dns packet failed. {}", e);
+                warn!("process parse dns packet failed. {}", e);
 
                 self.get_forwarder(None).await.ok()
             }

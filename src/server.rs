@@ -1,36 +1,252 @@
 use async_trait::async_trait;
 use dns_parser::Packet;
-use flume::{unbounded, Receiver};
-use log::{error, info, warn};
+use flume::unbounded;
+use log::{debug, error, warn};
 use std::cmp;
-use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::RwLock;
+
+struct Forwarder {
+    server: ServerInfo,
+
+    udp_socket: Option<UdpSocket>,
+    tcp_socket: Option<TcpStream>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerInfo {
+    pub addr: SocketAddr,
+    pub is_tcp: bool,
+}
+
+impl FromStr for ServerInfo {
+    type Err = Box<dyn std::error::Error + Send + Sync>;
+
+    fn from_str(server: &str) -> Result<Self, Self::Err> {
+        let mut is_tcp = false;
+
+        let s = server.split("/").collect::<Vec<&str>>();
+        let server_only = if s.len() == 2 {
+            if s[0] == "tcp" {
+                is_tcp = true;
+            }
+
+            s[1]
+        } else if s.len() == 1 {
+            s[0]
+        } else {
+            return Err(format!("invalid server format: {}", server).into());
+        };
+
+        let s = server_only.split(":").collect::<Vec<&str>>();
+        let server_with_port = if s.len() == 1 {
+            format!("{}:53", s[0]).to_string()
+        } else {
+            server_only.to_string()
+        };
+
+        Ok(ServerInfo {
+            is_tcp: is_tcp,
+            addr: SocketAddr::from_str(&server_with_port)?,
+        })
+    }
+    //
+}
 
 #[async_trait]
 pub trait RecordCallback<T>: Send + Sync {
-    async fn request(&self, res: &Packet<'_>) -> (bool, Option<T>);
-    async fn response(&self, req: Option<&Packet<'_>>, context: Option<T>);
+    async fn request(&self, res: &Packet<'_>) -> Option<(ServerInfo, T)>;
+    async fn response(&self, req: &Packet<'_>, context: T);
 }
 
-pub struct DnsServer<T> {
-    udp_socket: Arc<UdpSocket>,
-    tcp_server: Option<TcpStream>,
+impl Forwarder {
+    pub fn new(server: ServerInfo) -> Self {
+        Forwarder {
+            server,
+            udp_socket: None,
+            tcp_socket: None,
+        }
+    }
 
-    upstream: String,
-    callback: Arc<Box<dyn RecordCallback<T>>>,
+    async fn send(
+        &mut self,
+        data: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            if self.server.is_tcp {
+                if self.tcp_socket.is_none() {
+                    self.connect_remote_server().await;
+                }
+
+                let tcp_server = self.tcp_socket.as_mut().unwrap();
+
+                let size = data.len() as u16;
+                match tcp_server.write(&size.to_be_bytes()).await {
+                    Err(e) => {
+                        if !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            warn!("tcp write size failed. {}", e);
+                        }
+
+                        self.tcp_socket = None;
+                        continue;
+                    }
+                    Ok(r) => {
+                        if r < size_of::<u16>() {
+                            warn!("forward data failed. {}", size);
+                            self.tcp_socket = None;
+                            continue;
+                        }
+                    }
+                }
+
+                match tcp_server.write(data).await {
+                    Err(e) => {
+                        if !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            warn!("tcp write size failed. {}", e);
+                        }
+
+                        self.tcp_socket = None;
+                        continue;
+                    }
+                    Ok(r) => {
+                        if r < data.len() {
+                            warn!("forward data failed. {}", size);
+                            self.tcp_socket = None;
+                            continue;
+                        }
+                    }
+                }
+
+                let size = match tcp_server.read_u16().await {
+                    Err(e) => {
+                        if !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            warn!("tcp read size failed. {}", e);
+                        }
+
+                        self.tcp_socket = None;
+                        continue;
+                    }
+                    Ok(s) => s,
+                };
+
+                let mut buff = vec![0 as u8; size as usize];
+                match tcp_server.read_exact(&mut buff).await {
+                    Err(e) => {
+                        if !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            warn!("tcp read data failed. {}", e);
+                        }
+
+                        self.tcp_socket = None;
+                        continue;
+                    }
+                    Ok(s) => {
+                        if usize::from(s) < size_of_val(&buff) {
+                            warn!("tcp read data failed.");
+                            self.tcp_socket = None;
+                            continue;
+                        }
+                    }
+                };
+
+                return Ok(buff);
+            }
+
+            if self.udp_socket.is_none() {
+                self.connect_remote_server().await;
+            }
+
+            let udp_socket = self.udp_socket.as_mut().unwrap();
+            match udp_socket.send(&data).await {
+                Err(e) => {
+                    error!("udp send data failed. {}", e);
+                    return Err(e.into());
+                }
+                Ok(size) => {
+                    if size < data.len() {
+                        error!("udp send data failed. {} < {}", size, data.len());
+                        return Err("udp send data failed.".into());
+                    }
+                }
+            }
+
+            let mut buff = [0; 1024];
+            match udp_socket.recv_from(&mut buff).await {
+                Err(e) => {
+                    error!("udp recv data failed. {}", e);
+                    return Err(e.into());
+                }
+                Ok((size, _)) => {
+                    return Ok(buff[..size].to_vec());
+                }
+            }
+        }
+    }
+
+    async fn connect_remote_server(&mut self) {
+        loop {
+            if self.server.is_tcp {
+                if let Ok(s) = TcpStream::connect(&self.server.addr).await {
+                    self.tcp_socket = Some(s);
+                    break;
+                }
+
+                warn!("connect {} failed. try again later.", self.server.addr);
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+
+            if let Ok(s) = UdpSocket::bind("0.0.0.0:0").await {
+                if let Err(e) = s.connect(&self.server.addr).await {
+                    warn!("connect {} failed. {}", self.server.addr, e);
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+                self.udp_socket = s.into();
+                break;
+            }
+
+            warn!("bind {} failed. try again later.", self.server.addr);
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+    }
 }
 
-impl<T: 'static + std::marker::Send> DnsServer<T> {
-    pub async fn run(
+#[derive(Clone)]
+pub struct DnsServer {
+    fowarders: Arc<RwLock<Vec<Arc<RwLock<Forwarder>>>>>,
+}
+
+impl DnsServer {
+    pub fn new() -> Self {
+        DnsServer {
+            fowarders: Arc::new(RwLock::new(vec![])),
+        }
+    }
+
+    pub async fn run<T: 'static + Sync + Send>(
+        &self,
         port: Option<String>,
-        upstream: Option<String>,
         thread_num: Option<usize>,
         callback: Box<dyn RecordCallback<T>>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bind_with_port = if let Some(port) = port {
             if port.contains(":") {
                 port
@@ -41,34 +257,6 @@ impl<T: 'static + std::marker::Send> DnsServer<T> {
             String::from("127.0.0.1:5353")
         };
 
-        let upstream = if let Some(upstream) = upstream {
-            upstream
-        } else {
-            String::from("8.8.8.8:53")
-        };
-
-        let udp_socket = UdpSocket::bind(bind_with_port).await?;
-
-        let udp_server = Arc::new(udp_socket);
-        let udp_socket = udp_server.clone();
-
-        let (sender, receiver) = unbounded();
-
-        tokio::spawn(async move {
-            loop {
-                let mut buff = [0; 1024];
-                let rr = udp_server.recv_from(&mut buff).await;
-                if rr.is_err() {
-                    warn!("udp recv error. {:?}", rr.err());
-                    continue;
-                }
-                if let Some((size, src_addr)) = rr.ok() {
-                    let _ = sender.send_async((buff[..size].to_vec(), src_addr)).await;
-                }
-            }
-        });
-
-        let mut handles = vec![];
         let thread_num = if let Some(thread_num) = thread_num {
             cmp::min(thread_num, num_cpus::get())
         } else {
@@ -76,23 +264,46 @@ impl<T: 'static + std::marker::Send> DnsServer<T> {
         };
 
         let callback = Arc::new(callback);
+        let udp_socket = Arc::new(UdpSocket::bind(bind_with_port).await?);
+        let server = Arc::new(self.clone());
 
-        for _ in 0..thread_num {
-            let udp_socket = udp_socket.clone();
-            let receiver = receiver.clone();
+        let (sender, receiver) = unbounded();
+        let mut handles = vec![];
 
-            let callback = callback.clone();
-
-            let mut s = DnsServer::<T> {
-                udp_socket,
-                upstream: upstream.clone(),
-
-                tcp_server: None,
-                callback,
-            };
+        for _ in 0..std::cmp::max(thread_num / 2, 1) {
+            let udp_server = udp_socket.clone();
+            let sender = sender.clone();
 
             handles.push(tokio::spawn(async move {
-                Self::process(&mut s, receiver).await;
+                loop {
+                    let mut buff = [0; 1024];
+                    let rr = udp_server.recv_from(&mut buff).await;
+                    if rr.is_err() {
+                        warn!("udp recv error. {:?}", rr.err());
+                        continue;
+                    }
+
+                    if let Some((size, src_addr)) = rr.ok() {
+                        let _ = sender.send_async((buff[..size].to_vec(), src_addr)).await;
+                    }
+                }
+            }));
+        }
+
+        for _ in 0..thread_num {
+            let callback = callback.clone();
+            let receiver = receiver.clone();
+            let server = server.clone();
+            let reply = udp_socket.clone();
+
+            handles.push(tokio::spawn(async move {
+                loop {
+                    if let Ok((buff, src_addr)) = receiver.recv_async().await {
+                        server
+                            .process(&buff, reply.clone(), src_addr, callback.clone())
+                            .await;
+                    }
+                }
             }));
         }
 
@@ -103,127 +314,95 @@ impl<T: 'static + std::marker::Send> DnsServer<T> {
         Ok(())
     }
 
-    async fn process(dns_server: &mut DnsServer<T>, receiver: Receiver<(Vec<u8>, SocketAddr)>) {
-        loop {
-            let rr = receiver.recv_async().await;
-            if rr.is_err() {
-                continue;
-            }
-
-            let (buff, src_addr) = rr.ok().unwrap();
-
-            let dns_res_packet = dns_parser::Packet::parse(&buff);
-            if dns_res_packet.is_err() {
-                warn!(
-                    "parse dns packet failed. {:?}",
-                    dns_res_packet.as_ref().err()
-                );
-            }
-
-            let callback = dns_server.callback.clone();
-
-            let mut res_context = None;
-
-            if let Ok(dns_res_packet) = dns_res_packet {
-                let (pass, context) = callback.request(&dns_res_packet).await;
-                res_context = context;
-
-                if !pass {
+    async fn process<T>(
+        &self,
+        buff: &[u8],
+        reply: Arc<UdpSocket>,
+        src_addr: SocketAddr,
+        callback: Arc<Box<dyn RecordCallback<T>>>,
+    ) {
+        let mut res_context = None;
+        let fowarder = match dns_parser::Packet::parse(&buff) {
+            Ok(dns_res_packet) => {
+                let upstream = callback.request(&dns_res_packet).await;
+                if upstream.is_none() {
                     if let Ok(record) = dns_parser::Builder::new_query(
                         dns_res_packet.header.id,
                         dns_res_packet.header.recursion_available,
                     )
                     .build()
                     {
-                        let _ = dns_server.udp_socket.send_to(&record, src_addr).await;
+                        let _ = reply.send_to(&record, src_addr).await;
                     }
 
-                    continue;
+                    return;
                 }
+
+                let (server, res_context2) = upstream.unwrap();
+                res_context = res_context2.into();
+
+                self.get_forwarder(Some(&server)).await.ok()
             }
+            Err(e) => {
+                warn!("parse dns packet failed. {}", e);
 
-            loop {
-                let req_buff = dns_server.forward(&buff).await;
+                self.get_forwarder(None).await.ok()
+            }
+        }
+        .unwrap();
 
-                if req_buff.is_err() {
-                    let err = req_buff.err().unwrap();
+        let mut fowarder = fowarder.write().await;
+        let req_buff = fowarder.send(&buff).await;
+        if req_buff.is_err() {
+            error!(
+                "forward dns request failed. {}",
+                req_buff.as_ref().err().unwrap()
+            );
+            return;
+        }
 
-                    match err.kind() {
-                        ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof => {}
-                        _ => {
-                            warn!("{}", err.to_string());
-                        }
-                    }
+        let req_buff = req_buff.unwrap();
 
-                    dns_server.tcp_server = None;
-                    continue;
-                }
-
-                let req_buff = req_buff.ok().unwrap();
-
-                let dns_req_packet = dns_parser::Packet::parse(&req_buff);
-                if dns_req_packet.is_err() {
-                    warn!(
-                        "parse dns packet failed. {:?}",
-                        dns_req_packet.as_ref().err()
-                    );
-                }
-
+        match dns_parser::Packet::parse(&req_buff) {
+            Ok(dns_req_packet) => {
                 callback
-                    .response(dns_req_packet.ok().as_ref(), res_context)
+                    .response(&dns_req_packet, res_context.unwrap())
                     .await;
-
-                let _ = dns_server.udp_socket.send_to(&req_buff, src_addr).await;
-                break;
+            }
+            Err(e) => {
+                warn!("parse dns packet failed. {}", e);
             }
         }
+
+        let _ = reply.send_to(&req_buff, src_addr).await;
     }
 
-    async fn forward(&mut self, data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-        if self.tcp_server.is_none() {
-            self.connect_remote_server().await;
-        }
+    async fn get_forwarder(
+        &self,
+        server: Option<&ServerInfo>,
+    ) -> Result<Arc<RwLock<Forwarder>>, Box<dyn std::error::Error + Send + Sync>> {
+        let fowarders = self.fowarders.read().await;
+        debug!("get_forwarder: {:?}, size: {}", server, fowarders.len());
 
-        let tcp_server = self.tcp_server.as_mut().unwrap();
-
-        let size = data.len() as u16;
-        let r = tcp_server.write(&size.to_be_bytes()).await?;
-        if r < size_of::<u16>() {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("forward data failed. {}", size),
-            ));
-        }
-
-        let r = tcp_server.write(data).await?;
-        if r < data.len() {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("forward data failed. {}", size),
-            ));
-        }
-
-        let size = tcp_server.read_u16().await?;
-
-        let mut buff = vec![0 as u8; size as usize];
-        let size = tcp_server.read_exact(&mut buff).await?;
-
-        if size < size_of_val(&buff) {
-            return Err(Error::new(ErrorKind::Other, "tcp read data failed."));
-        }
-
-        return Ok(buff);
-    }
-
-    async fn connect_remote_server(&mut self) {
-        loop {
-            if let Ok(s) = TcpStream::connect(&self.upstream).await {
-                self.tcp_server = Some(s);
-                break;
+        for n in fowarders.iter() {
+            if let Ok(m) = n.try_write() {
+                if server == Some(&m.server) {
+                    return Ok(n.clone());
+                }
             }
-
-            warn!("connect {} failed. try again later.", &self.upstream);
-            std::thread::sleep(Duration::from_secs(1));
         }
+        drop(fowarders);
+
+        let default_server = ServerInfo {
+            addr: SocketAddr::from_str("8.8.8.8:53").unwrap(),
+            is_tcp: true,
+        };
+        let server = server.unwrap_or(&default_server);
+
+        let mut fowarders = self.fowarders.write().await;
+        let forward = Arc::new(RwLock::new(Forwarder::new(server.to_owned())));
+        fowarders.push(forward.clone());
+
+        Ok(forward)
     }
 }

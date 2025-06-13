@@ -183,12 +183,12 @@ impl Forwarder {
             let udp_socket = self.udp_socket.as_mut().unwrap();
             match udp_socket.send(&data).await {
                 Err(e) => {
-                    error!("udp send data failed. {}", e);
+                    self.udp_socket = None;
                     return Err(e.into());
                 }
                 Ok(size) => {
                     if size < data.len() {
-                        error!("udp send data failed. {} < {}", size, data.len());
+                        self.udp_socket = None;
                         return Err("udp send data failed.".into());
                     }
                 }
@@ -200,10 +200,11 @@ impl Forwarder {
                     return Ok(buff[..size].to_vec());
                 }
                 Ok(Err(e)) => {
-                    error!("udp recv data failed. {}", e);
+                    self.udp_socket = None;
                     return Err(e.into());
                 }
                 Err(_) => {
+                    self.udp_socket = None;
                     return Err("udp recv data timeout.".into());
                 }
             }

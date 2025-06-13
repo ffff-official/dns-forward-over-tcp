@@ -77,6 +77,8 @@ impl Forwarder {
         &mut self,
         data: &[u8],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        static TIME_OUT: tokio::time::Duration = tokio::time::Duration::from_secs(3);
+
         loop {
             if self.server.is_tcp {
                 if self.tcp_socket.is_none() {
@@ -87,17 +89,6 @@ impl Forwarder {
 
                 let size = data.len() as u16;
                 match tcp_server.write(&size.to_be_bytes()).await {
-                    Err(e) => {
-                        if !matches!(
-                            e.kind(),
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
-                        ) {
-                            warn!("tcp write size failed. {}", e);
-                        }
-
-                        self.tcp_socket = None;
-                        continue;
-                    }
                     Ok(r) => {
                         if r < size_of::<u16>() {
                             warn!("forward data failed. {}", size);
@@ -105,9 +96,6 @@ impl Forwarder {
                             continue;
                         }
                     }
-                }
-
-                match tcp_server.write(data).await {
                     Err(e) => {
                         if !matches!(
                             e.kind(),
@@ -119,6 +107,9 @@ impl Forwarder {
                         self.tcp_socket = None;
                         continue;
                     }
+                }
+
+                match tcp_server.write(data).await {
                     Ok(r) => {
                         if r < data.len() {
                             warn!("forward data failed. {}", size);
@@ -126,10 +117,22 @@ impl Forwarder {
                             continue;
                         }
                     }
+                    Err(e) => {
+                        if !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            warn!("tcp write size failed. {}", e);
+                        }
+
+                        self.tcp_socket = None;
+                        continue;
+                    }
                 }
 
-                let size = match tcp_server.read_u16().await {
-                    Err(e) => {
+                let size = match tokio::time::timeout(TIME_OUT, tcp_server.read_u16()).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
                         if !matches!(
                             e.kind(),
                             std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
@@ -140,12 +143,21 @@ impl Forwarder {
                         self.tcp_socket = None;
                         continue;
                     }
-                    Ok(s) => s,
+                    Err(_) => {
+                        return Err("tcp read size timeout.".into());
+                    }
                 };
 
                 let mut buff = vec![0 as u8; size as usize];
-                match tcp_server.read_exact(&mut buff).await {
-                    Err(e) => {
+                match tokio::time::timeout(TIME_OUT, tcp_server.read_exact(&mut buff)).await {
+                    Ok(Ok(s)) => {
+                        if usize::from(s) < size_of_val(&buff) {
+                            warn!("tcp read data failed.");
+                            self.tcp_socket = None;
+                            continue;
+                        }
+                    }
+                    Ok(Err(e)) => {
                         if !matches!(
                             e.kind(),
                             std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
@@ -156,14 +168,10 @@ impl Forwarder {
                         self.tcp_socket = None;
                         continue;
                     }
-                    Ok(s) => {
-                        if usize::from(s) < size_of_val(&buff) {
-                            warn!("tcp read data failed.");
-                            self.tcp_socket = None;
-                            continue;
-                        }
+                    Err(_) => {
+                        return Err("tcp read data timeout.".into());
                     }
-                };
+                }
 
                 return Ok(buff);
             }
@@ -187,13 +195,16 @@ impl Forwarder {
             }
 
             let mut buff = [0; 1024];
-            match udp_socket.recv_from(&mut buff).await {
-                Err(e) => {
+            match tokio::time::timeout(TIME_OUT, udp_socket.recv_from(&mut buff)).await {
+                Ok(Ok((size, _))) => {
+                    return Ok(buff[..size].to_vec());
+                }
+                Ok(Err(e)) => {
                     error!("udp recv data failed. {}", e);
                     return Err(e.into());
                 }
-                Ok((size, _)) => {
-                    return Ok(buff[..size].to_vec());
+                Err(_) => {
+                    return Err("udp recv data timeout.".into());
                 }
             }
         }
@@ -353,6 +364,7 @@ impl DnsServer {
 
         let mut fowarder = fowarder.write().await;
         let req_buff = fowarder.send(&buff).await;
+        drop(fowarder);
         if req_buff.is_err() {
             error!(
                 "forward dns request failed. {}",
@@ -386,6 +398,10 @@ impl DnsServer {
 
         for n in fowarders.iter() {
             if let Ok(m) = n.try_write() {
+                if server.is_none() {
+                    return Ok(n.clone());
+                }
+
                 if server == Some(&m.server) {
                     return Ok(n.clone());
                 }
@@ -393,11 +409,11 @@ impl DnsServer {
         }
         drop(fowarders);
 
-        let default_server = ServerInfo {
-            addr: SocketAddr::from_str("8.8.8.8:53").unwrap(),
-            is_tcp: true,
-        };
-        let server = server.unwrap_or(&default_server);
+        if server.is_none() {
+            return Err("No server provided to get_forwarder".into());
+        }
+
+        let server = server.unwrap();
 
         let mut fowarders = self.fowarders.write().await;
         let forward = Arc::new(RwLock::new(Forwarder::new(server.to_owned())));

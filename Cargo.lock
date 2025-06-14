@@ -132,8 +132,7 @@ dependencies = [
 [[package]]
 name = "dns-parser"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4d33be9473d06f75f58220f71f7a9317aca647dc061dbd3c361b0bef505fbea"
+source = "git+https://github.com/ffff-official/dns-parser.git?branch=dev#70cd299822def1b2505fc8cd8ac966026fcf93b5"
 dependencies = [
  "byteorder",
  "quick-error",

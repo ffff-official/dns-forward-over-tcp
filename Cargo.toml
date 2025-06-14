@@ -15,7 +15,9 @@ authors = ["F <f@ffff.im>"]
 
 [dependencies]
 log = "0.4.17"
-dns-parser = "0.8.0"
+#dns-parser = "0.8.0"
+#dns-parser = { path = "../dns-parser" }
+dns-parser = { git = "https://github.com/ffff-official/dns-parser.git", branch = "dev" }
 tokio = { version = "1.45.1", features = ["full"] }
 simple_logger = "2.3.0"
 getopts = "0.2"

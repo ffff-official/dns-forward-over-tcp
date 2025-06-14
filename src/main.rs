@@ -94,10 +94,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
-    let s = DnsServer::new();
+    let mut s = DnsServer::new();
     if let Err(e) = s
         .run(
             port,
+            None,
             thread_num,
             Box::new(LogRecord::new(upstream.as_deref())),
         )

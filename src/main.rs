@@ -4,7 +4,6 @@ use dns_forward_over_tcp::server::RecordCallback;
 use dns_forward_over_tcp::server::ServerInfo;
 use getopts::Options;
 use log::debug;
-use log::info;
 use std::env;
 use std::error::Error;
 use std::time::Instant;
@@ -74,7 +73,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "IP:PORT",
     );
     opts.optopt("p", "", "listen port. default is :5353", "[IP]:PORT");
-    opts.optopt("t", "thread", "thread num. default is 2", "NUM");
     opts.optflag("h", "help", "print this help menu");
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -88,20 +86,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let port = matches.opt_str("p");
     let upstream = matches.opt_str("u");
-    let thread_num = if let Some(thread_num) = matches.opt_str("t") {
-        thread_num.parse::<usize>().ok()
-    } else {
-        None
-    };
 
-    let mut s = DnsServer::new();
+    let s = DnsServer::new();
     if let Err(e) = s
-        .run(
-            port,
-            None,
-            thread_num,
-            Box::new(LogRecord::new(upstream.as_deref())),
-        )
+        .run(port, None, Box::new(LogRecord::new(upstream.as_deref())))
         .await
     {
         panic!("Error running DNS server: {}", e);

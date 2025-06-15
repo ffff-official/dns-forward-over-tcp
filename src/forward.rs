@@ -1,0 +1,206 @@
+use std::time::Duration;
+
+use log::{debug, warn};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpStream, UdpSocket},
+};
+
+use crate::server::ServerInfo;
+
+pub struct Forwarder {
+    pub server: ServerInfo,
+
+    udp_socket: Option<UdpSocket>,
+    tcp_socket: Option<TcpStream>,
+}
+
+impl Forwarder {
+    pub fn new(server: ServerInfo) -> Self {
+        Self {
+            server,
+            udp_socket: None,
+            tcp_socket: None,
+        }
+    }
+
+    pub async fn send(
+        &mut self,
+        data: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        static TIME_OUT: tokio::time::Duration = tokio::time::Duration::from_secs(3);
+
+        loop {
+            self.connect_remote_server().await?;
+
+            if self.server.is_tcp {
+                let tcp_server = self.tcp_socket.as_mut().unwrap();
+
+                let size = data.len() as u16;
+                match tcp_server.write(&size.to_be_bytes()).await {
+                    Ok(r) => {
+                        if r < size_of::<u16>() {
+                            warn!("forward data failed. {}", size);
+                            self.tcp_socket = None;
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        if !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            warn!("tcp write size failed. {}", e);
+                        }
+
+                        self.tcp_socket = None;
+                        continue;
+                    }
+                }
+
+                match tcp_server.write(data).await {
+                    Ok(r) => {
+                        if r < data.len() {
+                            warn!("forward data failed. {}", size);
+                            self.tcp_socket = None;
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        if !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            warn!("tcp write size failed. {}", e);
+                        }
+
+                        self.tcp_socket = None;
+                        continue;
+                    }
+                }
+
+                let size = match tokio::time::timeout(TIME_OUT, tcp_server.read_u16()).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        if !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            warn!("tcp read size failed. {}", e);
+                        }
+
+                        self.tcp_socket = None;
+                        continue;
+                    }
+                    Err(_) => {
+                        return Err("tcp read size timeout.".into());
+                    }
+                };
+
+                let mut buff = vec![0 as u8; size as usize];
+                match tokio::time::timeout(TIME_OUT, tcp_server.read_exact(&mut buff)).await {
+                    Ok(Ok(s)) => {
+                        if usize::from(s) < size_of_val(&buff) {
+                            warn!("tcp read data failed.");
+                            self.tcp_socket = None;
+                            continue;
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        if !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            warn!("tcp read data failed. {}", e);
+                        }
+
+                        self.tcp_socket = None;
+                        continue;
+                    }
+                    Err(_) => {
+                        return Err("tcp read data timeout.".into());
+                    }
+                }
+
+                return Ok(buff);
+            }
+
+            let udp_socket = self.udp_socket.as_mut().unwrap();
+            match udp_socket.send(&data).await {
+                Ok(size) => {
+                    if size < data.len() {
+                        self.udp_socket = None;
+                        return Err("udp send data failed.".into());
+                    }
+                }
+                Err(e) => {
+                    self.udp_socket = None;
+                    return Err(e.into());
+                }
+            }
+
+            let mut buff = [0; 1024];
+            match tokio::time::timeout(TIME_OUT, udp_socket.recv_from(&mut buff)).await {
+                Ok(Ok((size, _))) => {
+                    return Ok(buff[..size].to_vec());
+                }
+                Ok(Err(e)) => {
+                    self.udp_socket = None;
+                    return Err(e.into());
+                }
+                Err(_) => {
+                    self.udp_socket = None;
+                    return Err(format!("udp recv data timeout.").into());
+                }
+            }
+        }
+    }
+
+    async fn connect_remote_server(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut retry_count = 0;
+
+        loop {
+            if self.server.is_tcp {
+                if self.tcp_socket.is_some() {
+                    return Ok(());
+                }
+
+                debug!("connect tcp {}", self.server.addr);
+                if let Ok(s) = TcpStream::connect(&self.server.addr).await {
+                    self.tcp_socket = Some(s);
+                    return Ok(());
+                }
+
+                if retry_count >= 3 {
+                    break;
+                }
+
+                retry_count += 1;
+                warn!(
+                    "connect {} failed. try again later. retry count: {}",
+                    self.server.addr, retry_count
+                );
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+
+            if self.udp_socket.is_some() {
+                return Ok(());
+            }
+
+            if let Ok(s) = UdpSocket::bind("0.0.0.0:0").await {
+                if let Err(e) = s.connect(&self.server.addr).await {
+                    return Err(format!("udp connect {} failed. {}", self.server.addr, e).into());
+                }
+                self.udp_socket = s.into();
+                return Ok(());
+            }
+
+            return Err(format!("bind {} failed. try again later.", self.server.addr).into());
+        }
+
+        Err("connect remote server failed.".into())
+    }
+}

@@ -132,7 +132,7 @@ dependencies = [
 [[package]]
 name = "dns-parser"
 version = "0.8.0"
-source = "git+https://github.com/ffff-official/dns-parser.git?branch=dev#70cd299822def1b2505fc8cd8ac966026fcf93b5"
+source = "git+https://github.com/ffff-official/dns-parser.git?branch=dev#3a1afde155b3cf2b73b7ef8ea4b3cd6b86a783fb"
 dependencies = [
  "byteorder",
  "quick-error",

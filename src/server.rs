@@ -13,9 +13,18 @@ use crate::forward::Forwarder;
 static DEFAULT_UPSTREAM: OnceCell<ServerInfo> = OnceCell::const_new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DNSPriority {
+    Low = -1,
+    Normal = 0,
+    High = 1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInfo {
     pub addr: SocketAddr,
     pub is_tcp: bool,
+
+    pub priority: DNSPriority,
 }
 
 impl FromStr for ServerInfo {
@@ -47,6 +56,7 @@ impl FromStr for ServerInfo {
         Ok(ServerInfo {
             is_tcp: is_tcp,
             addr: SocketAddr::from_str(&server_with_port)?,
+            priority: DNSPriority::Normal,
         })
     }
     //
@@ -96,7 +106,7 @@ impl DnsServer {
             String::from("127.0.0.1:5353")
         };
 
-        let spwan_num = num_cpus::get() * 2;
+        let spwan_num = num_cpus::get();
 
         DEFAULT_UPSTREAM
             .get_or_init(|| async {
@@ -133,17 +143,52 @@ impl DnsServer {
             }));
         }
 
+        let (forward_sender, forward_receiver) =
+            unbounded::<(Arc<RwLock<Forwarder>>, SocketAddr, Vec<u8>, Option<T>)>();
+
         for _ in 0..spwan_num {
             let callback = callback.clone();
             let receiver = receiver.clone();
             let server = server.clone();
             let reply = udp_socket.clone();
+            let forward_sender = forward_sender.clone();
 
             handles.push(tokio::spawn(async move {
                 loop {
                     if let Ok((buff, src_addr)) = receiver.recv_async().await {
                         server
-                            .process(&buff, reply.clone(), src_addr, callback.clone())
+                            .process(
+                                &buff,
+                                forward_sender.clone(),
+                                reply.clone(),
+                                src_addr,
+                                callback.clone(),
+                            )
+                            .await;
+                    }
+                }
+            }));
+        }
+
+        for _ in 0..spwan_num {
+            let callback = callback.clone();
+            let receiver = forward_receiver.clone();
+            let server = server.clone();
+            let reply = udp_socket.clone();
+
+            handles.push(tokio::spawn(async move {
+                loop {
+                    if let Ok((fowarder, src_addr, buff, res_context)) = receiver.recv_async().await
+                    {
+                        server
+                            .process_forward(
+                                fowarder,
+                                src_addr,
+                                &buff,
+                                reply.clone(),
+                                callback.clone(),
+                                res_context,
+                            )
                             .await;
                     }
                 }
@@ -160,22 +205,15 @@ impl DnsServer {
     async fn process<T>(
         &self,
         buff: &[u8],
+        forward_sender: flume::Sender<(Arc<RwLock<Forwarder>>, SocketAddr, Vec<u8>, Option<T>)>,
         reply: Arc<UdpSocket>,
         src_addr: SocketAddr,
         callback: Arc<Box<dyn RecordCallback<T>>>,
     ) {
         let mut res_context = None;
-        let mut qname = None;
-        let mut qtype = None;
+        let mut priority = DNSPriority::Normal;
         let fowarder = match dns_parser::Packet::parse(&buff) {
             Ok(dns_res_packet) => {
-                if dns_res_packet.questions.len() > 0 {
-                    if let Some(question) = dns_res_packet.questions.first() {
-                        qname = question.qname.into();
-                        qtype = question.qtype.into();
-                    }
-                }
-
                 let upstream = callback.request(&dns_res_packet).await;
                 if upstream.is_none() {
                     let mut b = dns_parser::Builder::new_query(
@@ -219,6 +257,7 @@ impl DnsServer {
                 }
 
                 let (server, res_context2) = upstream.unwrap();
+                priority = server.priority.clone();
                 res_context = res_context2.into();
 
                 self.get_forwarder(Some(&server)).await.ok()
@@ -231,33 +270,54 @@ impl DnsServer {
         }
         .unwrap();
 
-        let mut fowarder = fowarder.write().await;
-        let req_buff = fowarder.send(&buff).await;
-        if req_buff.is_err() {
-            error!(
-                "forward dns request failed. {:?} {:?} {}",
-                qname,
-                qtype,
-                req_buff.as_ref().err().unwrap()
-            );
-            return;
+        if priority == DNSPriority::High {
+            self.process_forward(
+                fowarder,
+                src_addr,
+                &buff,
+                reply.clone(),
+                callback.clone(),
+                res_context,
+            )
+            .await;
+        } else {
+            let _ = forward_sender
+                .send_async((fowarder, src_addr, buff.to_vec(), res_context))
+                .await;
         }
-        drop(fowarder);
+    }
 
-        let req_buff = req_buff.unwrap();
+    async fn process_forward<T>(
+        &self,
+        fowarder: Arc<RwLock<Forwarder>>,
+        src_addr: SocketAddr,
+        buff: &[u8],
+        reply: Arc<UdpSocket>,
+        callback: Arc<Box<dyn RecordCallback<T>>>,
+        res_context: Option<T>,
+    ) {
+        let mut fowarder = fowarder.write().await;
+        match fowarder.send(&buff).await {
+            Ok(req_buff) => {
+                match dns_parser::Packet::parse(&req_buff) {
+                    Ok(dns_req_packet) => {
+                        callback
+                            .response(&dns_req_packet, res_context.unwrap())
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("parse req dns packet failed. {}", e);
+                    }
+                }
 
-        match dns_parser::Packet::parse(&req_buff) {
-            Ok(dns_req_packet) => {
-                callback
-                    .response(&dns_req_packet, res_context.unwrap())
-                    .await;
+                let _ = reply.send_to(&req_buff, src_addr).await;
             }
             Err(e) => {
-                warn!("parse req dns packet failed. {:?} {:?} {}", qname, qtype, e);
+                let p = dns_parser::Packet::parse(&buff);
+
+                error!("forward dns request failed. {:?}, {}", p, e);
             }
         }
-
-        let _ = reply.send_to(&req_buff, src_addr).await;
     }
 
     async fn get_forwarder(

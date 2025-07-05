@@ -4,6 +4,7 @@ use log::{debug, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
+    time::{sleep, timeout},
 };
 
 use crate::server::ServerInfo;
@@ -209,9 +210,28 @@ impl Forwarder {
                 }
 
                 debug!("connect tcp {}", self.server.addr);
-                if let Ok(s) = TcpStream::connect(&self.server.addr).await {
-                    self.tcp_socket = Some(s);
-                    return Ok(());
+                match timeout(
+                    Duration::from_secs(3),
+                    TcpStream::connect(&self.server.addr),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => {
+                        self.tcp_socket = Some(s);
+                        return Ok(());
+                    }
+                    Ok(Err(_)) => {
+                        warn!(
+                            "connect {} failed. try again later. retry count: {}",
+                            self.server.addr, retry_count
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            "connect {} timeout. try again later. retry count: {}",
+                            self.server.addr, retry_count
+                        );
+                    }
                 }
 
                 if retry_count >= 3 {
@@ -219,11 +239,7 @@ impl Forwarder {
                 }
 
                 retry_count += 1;
-                warn!(
-                    "connect {} failed. try again later. retry count: {}",
-                    self.server.addr, retry_count
-                );
-                std::thread::sleep(Duration::from_secs(1));
+                sleep(Duration::from_secs(1)).await;
                 continue;
             }
 

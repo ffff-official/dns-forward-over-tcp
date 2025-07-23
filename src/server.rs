@@ -123,7 +123,7 @@ impl DnsServer {
         let (sender, receiver) = unbounded();
         let mut handles = vec![];
 
-        {
+        for _ in 0..spwan_num {
             let udp_server = udp_socket.clone();
             let sender = sender.clone();
 

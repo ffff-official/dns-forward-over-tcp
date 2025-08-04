@@ -257,7 +257,16 @@ impl DnsServer {
                 }
 
                 let (server, res_context2) = upstream.unwrap();
-                priority = server.priority.clone();
+
+                if dns_res_packet.questions.len() > 0 {
+                    if dns_res_packet.questions[0].qtype == dns_parser::QueryType::PTR {
+                        priority = DNSPriority::Low;
+                    }
+                }
+                if priority != DNSPriority::Low {
+                    priority = server.priority.clone();
+                }
+
                 res_context = res_context2.into();
 
                 self.get_forwarder(Some(&server)).await.ok()

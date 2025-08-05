@@ -328,9 +328,9 @@ impl DnsServer {
                         if dns_req_packet.questions.len() > 0 {
                             let q = &dns_req_packet.questions[0];
                             let ttl = if dns_req_packet.answers.len() > 0 {
-                                dns_req_packet.answers[0].ttl
+                                std::cmp::max(dns_req_packet.answers[0].ttl, 300)
                             } else {
-                                600
+                                300
                             } as u64;
 
                             let mut cache = self.cache.write().await;
@@ -340,7 +340,7 @@ impl DnsServer {
                                     qtype: q.qtype,
                                 },
                                 req_buff.clone(),
-                                std::cmp::max(600, ttl),
+                                ttl,
                             );
                         }
 

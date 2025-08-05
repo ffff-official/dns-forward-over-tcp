@@ -1,13 +1,14 @@
 use async_trait::async_trait;
 use dns_parser::Packet;
 use flume::unbounded;
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{OnceCell, RwLock};
 
+use crate::cache::{DnsCache, DnsKey};
 use crate::forward::Forwarder;
 
 static DEFAULT_UPSTREAM: OnceCell<ServerInfo> = OnceCell::const_new();
@@ -80,12 +81,14 @@ pub trait RecordCallback<T>: Send + Sync {
 
 #[derive(Clone)]
 pub struct DnsServer {
+    cache: Arc<RwLock<DnsCache>>,
     fowarders: Arc<RwLock<Vec<Arc<RwLock<Forwarder>>>>>,
 }
 
 impl DnsServer {
     pub fn new() -> Self {
         DnsServer {
+            cache: Arc::new(RwLock::new(DnsCache::new())),
             fowarders: Arc::new(RwLock::new(vec![])),
         }
     }
@@ -214,6 +217,39 @@ impl DnsServer {
         let mut priority = DNSPriority::Normal;
         let fowarder = match dns_parser::Packet::parse(&buff) {
             Ok(dns_res_packet) => {
+                if dns_res_packet.questions.len() == 0 {
+                    let mut b = dns_parser::Builder::new_query(
+                        dns_res_packet.header.id,
+                        dns_res_packet.header.recursion_available,
+                    );
+
+                    b.set_response_code(dns_parser::ResponseCode::NameError);
+
+                    if let Ok(r) = b.build() {
+                        let _ = reply.send_to(&r, src_addr).await;
+                    }
+                    return;
+                }
+
+                let r = &dns_res_packet.questions[0];
+                let cache = self.cache.read().await;
+                if let Some(cache_buff) = cache.get(&DnsKey {
+                    name: r.qname.to_string(),
+                    qtype: r.qtype,
+                }) {
+                    let mut cache_buff = cache_buff.to_owned();
+                    cache_buff[0..2].copy_from_slice(&dns_res_packet.header.id.to_be_bytes());
+
+                    info!(
+                        "cache hit: {}, {:?}, {}",
+                        r.qname,
+                        r.qtype,
+                        cache_buff.len()
+                    );
+                    let _ = reply.send_to(&cache_buff, src_addr).await;
+                    return;
+                }
+
                 let upstream = callback.request(&dns_res_packet).await;
                 if upstream.is_none() {
                     let mut b = dns_parser::Builder::new_query(
@@ -221,35 +257,22 @@ impl DnsServer {
                         dns_res_packet.header.recursion_available,
                     );
 
-                    if dns_res_packet.questions.len() > 0 {
-                        let question = &dns_res_packet.questions[0];
-                        if matches!(
-                            question.qtype,
-                            dns_parser::QueryType::A | dns_parser::QueryType::AAAA
-                        ) {
-                            b.add_question(
-                                question.qname.to_string().as_str(),
-                                question.prefer_unicast,
-                                question.qtype,
-                                question.qclass,
-                            );
+                    let question = &dns_res_packet.questions[0];
+                    let qname = question.qname.to_string();
+                    let qtype = question.qtype;
 
-                            b.add_answer(
-                                question.qname.to_string().as_str(),
-                                3600,
-                                std::net::Ipv4Addr::new(0, 0, 0, 0),
-                            );
+                    b.add_question(&qname, question.prefer_unicast, qtype, question.qclass);
 
-                            if let Ok(r) = b.build() {
-                                let _ = reply.send_to(&r, src_addr).await;
-                            }
-
-                            return;
-                        }
+                    if matches!(
+                        qtype,
+                        dns_parser::QueryType::A | dns_parser::QueryType::AAAA
+                    ) {
+                        b.add_answer(&qname, 3600, std::net::Ipv4Addr::new(0, 0, 0, 0));
+                    } else {
+                        b.set_response_code(dns_parser::ResponseCode::NameError);
                     }
 
                     if let Ok(r) = b.build() {
-                        //fixme:
                         let _ = reply.send_to(&r, src_addr).await;
                     }
 
@@ -258,15 +281,7 @@ impl DnsServer {
 
                 let (server, res_context2) = upstream.unwrap();
 
-                if dns_res_packet.questions.len() > 0 {
-                    if dns_res_packet.questions[0].qtype == dns_parser::QueryType::PTR {
-                        priority = DNSPriority::Low;
-                    }
-                }
-                if priority != DNSPriority::Low {
-                    priority = server.priority.clone();
-                }
-
+                priority = server.priority.clone();
                 res_context = res_context2.into();
 
                 self.get_forwarder(Some(&server)).await.ok()
@@ -310,6 +325,25 @@ impl DnsServer {
             Ok(req_buff) => {
                 match dns_parser::Packet::parse(&req_buff) {
                     Ok(dns_req_packet) => {
+                        if dns_req_packet.questions.len() > 0 {
+                            let q = &dns_req_packet.questions[0];
+                            let ttl = if dns_req_packet.answers.len() > 0 {
+                                dns_req_packet.answers[0].ttl
+                            } else {
+                                600
+                            } as u64;
+
+                            let mut cache = self.cache.write().await;
+                            cache.insert(
+                                DnsKey {
+                                    name: q.qname.to_string(),
+                                    qtype: q.qtype,
+                                },
+                                req_buff.clone(),
+                                std::cmp::max(600, ttl),
+                            );
+                        }
+
                         callback
                             .response(&dns_req_packet, res_context.unwrap())
                             .await;

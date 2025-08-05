@@ -240,15 +240,11 @@ impl DnsServer {
                     let mut cache_buff = cache_buff.to_owned();
                     cache_buff[0..2].copy_from_slice(&dns_res_packet.header.id.to_be_bytes());
 
-                    info!(
-                        "cache hit: {}, {:?}, {}",
-                        r.qname,
-                        r.qtype,
-                        cache_buff.len()
-                    );
+                    info!("cache hit: {}, {:?}", r.qname, r.qtype,);
                     let _ = reply.send_to(&cache_buff, src_addr).await;
                     return;
                 }
+                drop(cache);
 
                 let upstream = callback.request(&dns_res_packet).await;
                 if upstream.is_none() {

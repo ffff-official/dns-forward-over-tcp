@@ -1,10 +1,12 @@
 use async_trait::async_trait;
+use bytes::{BufMut, Bytes, BytesMut};
 use dns_parser::Packet;
 use flume::unbounded;
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::sync::{OnceCell, RwLock};
 
@@ -93,7 +95,7 @@ impl DnsServer {
         }
     }
 
-    pub async fn run<T: 'static + Sync + Send>(
+    pub async fn run<T: 'static + Sync + Send + Copy>(
         &self,
         port: Option<String>,
         default_upstream: Option<String>,
@@ -132,7 +134,9 @@ impl DnsServer {
 
             handles.push(tokio::spawn(async move {
                 loop {
-                    let mut buff = [0; 1024];
+                    let mut buff = BytesMut::with_capacity(1024);
+                    buff.resize(1024, 0);
+
                     let rr = udp_server.recv_from(&mut buff).await;
                     if rr.is_err() {
                         warn!("udp recv error. {:?}", rr.err());
@@ -140,14 +144,22 @@ impl DnsServer {
                     }
 
                     if let Some((size, src_addr)) = rr.ok() {
-                        let _ = sender.send_async((buff[..size].to_vec(), src_addr)).await;
+                        buff.truncate(size);
+                        let buff = buff.freeze();
+
+                        let _ = sender.send_async((buff, src_addr, Instant::now())).await;
                     }
                 }
             }));
         }
 
-        let (forward_sender, forward_receiver) =
-            unbounded::<(Arc<RwLock<Forwarder>>, SocketAddr, Vec<u8>, Option<T>)>();
+        let (forward_sender, forward_receiver) = unbounded::<(
+            Arc<RwLock<Forwarder>>,
+            SocketAddr,
+            Bytes,
+            Option<T>,
+            Instant,
+        )>();
 
         for _ in 0..spwan_num {
             let callback = callback.clone();
@@ -155,19 +167,35 @@ impl DnsServer {
             let server = server.clone();
             let reply = udp_socket.clone();
             let forward_sender = forward_sender.clone();
+            let sender = sender.clone();
 
             handles.push(tokio::spawn(async move {
                 loop {
-                    if let Ok((buff, src_addr)) = receiver.recv_async().await {
-                        server
+                    if let Ok((buff, src_addr, t)) = receiver.recv_async().await {
+                        match server
                             .process(
-                                &buff,
+                                buff.clone(),
                                 forward_sender.clone(),
                                 reply.clone(),
                                 src_addr,
+                                t,
                                 callback.clone(),
                             )
-                            .await;
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
+                                    if io_error.kind() == std::io::ErrorKind::BrokenPipe {
+                                        warn!("forward failed. BrokenPipe, try again later.");
+
+                                        let _ = sender.send_async((buff, src_addr, t)).await;
+                                    } else {
+                                        error!("forward failed. {}", e);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }));
@@ -178,21 +206,48 @@ impl DnsServer {
             let receiver = forward_receiver.clone();
             let server = server.clone();
             let reply = udp_socket.clone();
+            let forward_sender = forward_sender.clone();
 
             handles.push(tokio::spawn(async move {
                 loop {
-                    if let Ok((fowarder, src_addr, buff, res_context)) = receiver.recv_async().await
+                    if let Ok((fowarder, src_addr, buff, res_context, t)) =
+                        receiver.recv_async().await
                     {
-                        server
+                        let fowarder_cloned = fowarder.clone();
+
+                        match server
                             .process_forward(
                                 fowarder,
                                 src_addr,
+                                t,
                                 &buff,
                                 reply.clone(),
                                 callback.clone(),
                                 res_context,
                             )
-                            .await;
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
+                                    if io_error.kind() == std::io::ErrorKind::BrokenPipe {
+                                        warn!("forward failed. BrokenPipe, try again later.");
+
+                                        let _ = forward_sender
+                                            .send_async((
+                                                fowarder_cloned,
+                                                src_addr,
+                                                buff,
+                                                res_context,
+                                                t,
+                                            ))
+                                            .await;
+                                    } else {
+                                        error!("forward failed. {}", e);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }));
@@ -207,12 +262,19 @@ impl DnsServer {
 
     async fn process<T>(
         &self,
-        buff: &[u8],
-        forward_sender: flume::Sender<(Arc<RwLock<Forwarder>>, SocketAddr, Vec<u8>, Option<T>)>,
+        buff: Bytes,
+        forward_sender: flume::Sender<(
+            Arc<RwLock<Forwarder>>,
+            SocketAddr,
+            Bytes,
+            Option<T>,
+            Instant,
+        )>,
         reply: Arc<UdpSocket>,
         src_addr: SocketAddr,
+        t: Instant,
         callback: Arc<Box<dyn RecordCallback<T>>>,
-    ) {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut res_context = None;
         let mut priority = DNSPriority::Normal;
         let fowarder = match dns_parser::Packet::parse(&buff) {
@@ -228,7 +290,8 @@ impl DnsServer {
                     if let Ok(r) = b.build() {
                         let _ = reply.send_to(&r, src_addr).await;
                     }
-                    return;
+
+                    return Ok(());
                 }
 
                 let r = &dns_res_packet.questions[0];
@@ -237,12 +300,13 @@ impl DnsServer {
                     name: r.qname.to_string(),
                     qtype: r.qtype,
                 }) {
-                    let mut cache_buff = cache_buff.to_owned();
+                    let mut cache_buff = cache_buff.to_vec();
                     cache_buff[0..2].copy_from_slice(&dns_res_packet.header.id.to_be_bytes());
 
-                    info!("cache hit: {}, {:?}", r.qname, r.qtype,);
+                    info!("cache hit: {}, {:?}", r.qname, r.qtype);
                     let _ = reply.send_to(&cache_buff, src_addr).await;
-                    return;
+
+                    return Ok(());
                 }
                 drop(cache);
 
@@ -272,7 +336,7 @@ impl DnsServer {
                         let _ = reply.send_to(&r, src_addr).await;
                     }
 
-                    return;
+                    return Ok(());
                 }
 
                 let (server, res_context2) = upstream.unwrap();
@@ -294,28 +358,32 @@ impl DnsServer {
             self.process_forward(
                 fowarder,
                 src_addr,
+                t,
                 &buff,
                 reply.clone(),
                 callback.clone(),
                 res_context,
             )
-            .await;
+            .await?;
         } else {
             let _ = forward_sender
-                .send_async((fowarder, src_addr, buff.to_vec(), res_context))
+                .send_async((fowarder, src_addr, buff, res_context, t))
                 .await;
         }
+
+        Ok(())
     }
 
     async fn process_forward<T>(
         &self,
         fowarder: Arc<RwLock<Forwarder>>,
         src_addr: SocketAddr,
+        t: Instant,
         buff: &[u8],
         reply: Arc<UdpSocket>,
         callback: Arc<Box<dyn RecordCallback<T>>>,
         res_context: Option<T>,
-    ) {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut fowarder = fowarder.write().await;
         match fowarder.send(&buff).await {
             Ok(req_buff) => {
@@ -352,11 +420,29 @@ impl DnsServer {
                 let _ = reply.send_to(&req_buff, src_addr).await;
             }
             Err(e) => {
-                let p = dns_parser::Packet::parse(&buff);
+                error!(
+                    "forward dns request failed. {:?}, {}",
+                    dns_parser::Packet::parse(&buff),
+                    e
+                );
 
-                error!("forward dns request failed. {:?}, {}", p, e);
+                if t.elapsed().as_secs() >= 10 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "forward dns request timeout",
+                    )
+                    .into());
+                }
+
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "forward dns request failed",
+                )
+                .into());
             }
         }
+
+        Ok(())
     }
 
     async fn get_forwarder(

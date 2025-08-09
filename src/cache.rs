@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::{collections::HashMap, time::Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -8,7 +9,7 @@ pub struct DnsKey {
 
 #[derive(Debug, Clone)]
 struct DnsEntry {
-    buff: Vec<u8>,
+    buff: Bytes,
     expires_at: Instant,
 }
 
@@ -24,16 +25,16 @@ impl DnsCache {
         }
     }
 
-    pub fn insert(&mut self, record: DnsKey, buff: Vec<u8>, ttl: u64) {
+    pub fn insert(&mut self, record: DnsKey, buff: Bytes, ttl: u64) {
         let expires_at = Instant::now() + std::time::Duration::from_secs(ttl);
         let entry = DnsEntry { buff, expires_at };
         self.entries.insert(record, entry);
     }
 
-    pub fn get(&self, record: &DnsKey) -> Option<&Vec<u8>> {
+    pub fn get(&self, record: &DnsKey) -> Option<Bytes> {
         if let Some(entry) = self.entries.get(record) {
             if entry.expires_at > Instant::now() {
-                return Some(&entry.buff);
+                return Some(entry.buff.clone());
             }
         }
         None

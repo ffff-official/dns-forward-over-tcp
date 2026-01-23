@@ -1,3 +1,6 @@
+use crate::cache::{DnsCache, DnsKey};
+use crate::forward::Forwarder;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use dns_parser::Packet;
@@ -9,9 +12,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::sync::{OnceCell, RwLock};
-
-use crate::cache::{DnsCache, DnsKey};
-use crate::forward::Forwarder;
 
 static DEFAULT_UPSTREAM: OnceCell<ServerInfo> = OnceCell::const_new();
 
@@ -31,7 +31,7 @@ pub struct ServerInfo {
 }
 
 impl FromStr for ServerInfo {
-    type Err = Box<dyn std::error::Error + Send + Sync>;
+    type Err = anyhow::Error;
 
     fn from_str(server: &str) -> Result<Self, Self::Err> {
         let mut is_tcp = false;
@@ -46,7 +46,7 @@ impl FromStr for ServerInfo {
         } else if s.len() == 1 {
             s[0]
         } else {
-            return Err(format!("invalid server format: {}", server).into());
+            bail!("invalid server format: {server}");
         };
 
         let s = server_only.split(":").collect::<Vec<&str>>();
@@ -100,7 +100,7 @@ impl DnsServer {
         port: Option<String>,
         default_upstream: Option<String>,
         callback: Box<dyn RecordCallback<T>>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<()> {
         let bind_with_port = if let Some(port) = port {
             if port.contains(":") {
                 port
@@ -274,7 +274,7 @@ impl DnsServer {
         src_addr: SocketAddr,
         t: Instant,
         callback: Arc<Box<dyn RecordCallback<T>>>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<()> {
         let mut res_context = None;
         let mut priority = DNSPriority::Normal;
         let fowarder = match dns_parser::Packet::parse(&buff) {
@@ -383,7 +383,7 @@ impl DnsServer {
         reply: Arc<UdpSocket>,
         callback: Arc<Box<dyn RecordCallback<T>>>,
         res_context: Option<T>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<()> {
         let mut fowarder = fowarder.write().await;
         match fowarder.send(&buff).await {
             Ok(req_buff) => {
@@ -427,28 +427,23 @@ impl DnsServer {
                 );
 
                 if t.elapsed().as_secs() >= 10 {
-                    return Err(std::io::Error::new(
+                    bail!(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "forward dns request timeout",
-                    )
-                    .into());
+                    ));
                 }
 
-                return Err(std::io::Error::new(
+                bail!(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "forward dns request failed",
-                )
-                .into());
+                ));
             }
         }
 
         Ok(())
     }
 
-    async fn get_forwarder(
-        &self,
-        server: Option<&ServerInfo>,
-    ) -> Result<Arc<RwLock<Forwarder>>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_forwarder(&self, server: Option<&ServerInfo>) -> Result<Arc<RwLock<Forwarder>>> {
         let fowarders = self.fowarders.read().await;
         debug!("get_forwarder: {:?}, size: {}", server, fowarders.len());
 

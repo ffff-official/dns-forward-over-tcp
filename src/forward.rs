@@ -1,3 +1,5 @@
+use crate::server::ServerInfo;
+use anyhow::{bail, Result};
 use bytes::{Bytes, BytesMut};
 use log::{debug, warn};
 use std::{io::IoSlice, time::Duration};
@@ -6,8 +8,6 @@ use tokio::{
     net::{TcpStream, UdpSocket},
     time::timeout,
 };
-
-use crate::server::ServerInfo;
 
 static TIME_OUT: tokio::time::Duration = tokio::time::Duration::from_secs(3);
 
@@ -27,10 +27,7 @@ impl Forwarder {
         }
     }
 
-    async fn send_udp(
-        &mut self,
-        data: &[u8],
-    ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    async fn send_udp(&mut self, data: &[u8]) -> Result<Bytes> {
         self.connect_remote_server().await?;
 
         let udp_socket = self.udp_socket.as_mut().unwrap();
@@ -38,12 +35,12 @@ impl Forwarder {
             Ok(size) => {
                 if size < data.len() {
                     self.udp_socket = None;
-                    return Err("udp send data failed.".into());
+                    bail!("udp send data failed.");
                 }
             }
             Err(e) => {
                 self.udp_socket = None;
-                return Err(e.into());
+                bail!("{e:?}");
             }
         }
 
@@ -57,18 +54,15 @@ impl Forwarder {
             }
             Ok(Err(e)) => {
                 self.udp_socket = None;
-                return Err(e.into());
+                bail!("{e:?}");
             }
             Err(_) => {
-                return Err("udp recv data timeout.".into());
+                bail!("udp recv data timeout.");
             }
         }
     }
 
-    async fn send_tcp(
-        &mut self,
-        data: &[u8],
-    ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    async fn send_tcp(&mut self, data: &[u8]) -> Result<Bytes> {
         self.connect_remote_server().await?;
 
         let tcp_server = self.tcp_socket.as_mut().unwrap();
@@ -80,7 +74,7 @@ impl Forwarder {
             Ok(size) => {
                 if size < size_of::<u16>() + data.len() {
                     self.tcp_socket = None;
-                    return Err(format!("forward data failed. {}", size).into());
+                    bail!("forward data failed. {size}");
                 }
             }
             Err(e) => {
@@ -91,7 +85,7 @@ impl Forwarder {
                 //     warn!("tcp write failed. {}", e);
                 // }
                 self.tcp_socket = None;
-                return Err(format!("tcp write failed. {}", e).into());
+                bail!("tcp write failed. {e:?}");
             }
         }
 
@@ -106,11 +100,11 @@ impl Forwarder {
                 // }
 
                 self.tcp_socket = None;
-                return Err(format!("tcp read size failed. {}", e).into());
+                bail!("tcp read size failed. {e:?}");
             }
             Err(_) => {
                 self.tcp_socket = None;
-                return Err("tcp read timeout".into());
+                bail!("tcp read timeout");
             }
         };
 
@@ -121,7 +115,7 @@ impl Forwarder {
             Ok(Ok(s)) => {
                 if usize::from(s) < size_of_val(&buff) {
                     self.tcp_socket = None;
-                    return Err(format!("tcp read data failed. size: {}", s).into());
+                    bail!("tcp read data failed. size: {s}");
                 }
             }
             Ok(Err(e)) => {
@@ -133,21 +127,18 @@ impl Forwarder {
                 // }
 
                 self.tcp_socket = None;
-                return Err(format!("tcp read data failed. {}", e).into());
+                bail!("tcp read data failed. {e:?}");
             }
             Err(_) => {
                 self.tcp_socket = None;
-                return Err("tcp read data timeout".into());
+                bail!("tcp read data timeout");
             }
         }
 
         return Ok(buff.freeze());
     }
 
-    pub async fn send(
-        &mut self,
-        data: &[u8],
-    ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn send(&mut self, data: &[u8]) -> Result<Bytes> {
         if self.server.is_tcp {
             self.send_tcp(data).await
         } else {
@@ -155,9 +146,7 @@ impl Forwarder {
         }
     }
 
-    async fn connect_remote_server(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn connect_remote_server(&mut self) -> Result<()> {
         if self.server.is_tcp {
             if self.tcp_socket.is_some() {
                 return Ok(());
@@ -175,10 +164,10 @@ impl Forwarder {
                     return Ok(());
                 }
                 Ok(Err(e)) => {
-                    return Err(format!("connect {} failed. {}", self.server.addr, e).into());
+                    bail!("connect {} failed. {e:?}", self.server.addr);
                 }
                 Err(_) => {
-                    return Err(format!("connect {} failed. timeout", self.server.addr).into());
+                    bail!("connect {} failed. timeout", self.server.addr);
                 }
             }
         }
@@ -189,12 +178,12 @@ impl Forwarder {
 
         if let Ok(s) = UdpSocket::bind("0.0.0.0:0").await {
             if let Err(e) = s.connect(&self.server.addr).await {
-                return Err(format!("udp connect {} failed. {}", self.server.addr, e).into());
+                bail!("udp connect {} failed. {e:?}", self.server.addr);
             }
             self.udp_socket = s.into();
             return Ok(());
         }
 
-        Err(format!("bind {} failed.", self.server.addr).into())
+        bail!("bind {} failed.", self.server.addr)
     }
 }
